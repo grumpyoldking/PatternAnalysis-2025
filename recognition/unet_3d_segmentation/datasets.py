@@ -1,6 +1,6 @@
 # dataloaders/prostate3d.py
 # deps: pip/conda install torch nibabel scipy numpy
-import os, glob, random
+import os, glob, random, re
 from typing import Tuple, Optional, List, Dict
 import numpy as np
 import nibabel as nib
@@ -112,16 +112,31 @@ def rand_intensity(img, gamma_range=(0.9, 1.1), noise_std=0.03):
     return x
 
 
+def _strip_nii_ext(basename: str) -> str:
+    """'file.nii.gz' -> 'file', 'file.nii' -> 'file'."""
+    return basename.replace(".nii.gz", "").replace(".nii", "")
+
+
+def _key_from_name(name: str) -> Optional[str]:
+    """
+    Extract canonical key 'Case_<id>_Week<k>' from filenames such as:
+        Case_004_Week0_SEMANTIC_LFOV.nii.gz
+        Case_004_Week0_T2W.nii.gz
+        Case_004_Week0.nii.gz
+    Returns None if the pattern isn't found.
+    """
+    m = re.match(r"^(Case_\d+_Week\d+)", _strip_nii_ext(name))
+    return m.group(1) if m else None
+
+
 # -------------------------- Dataset --------------------------
 
 class Prostate3DDataset(Dataset):
     """
     Directory layout:
       root/
-        images/ or imagesTr/
-          case_000.nii.gz ...
-        labels/ or labelsTr/
-          case_000.nii.gz ...
+        images/ or imagesTr/   (images with names like Case_004_Week0_*.nii.gz)
+        labels/ or labelsTr/   (labels with names like Case_004_Week0_*SEMANTIC*.nii.gz)
     """
     def __init__(
         self,
@@ -143,26 +158,56 @@ class Prostate3DDataset(Dataset):
         lbl_dir = next((os.path.join(root, d) for d in lbl_dirnames if os.path.isdir(os.path.join(root, d))), None)
         if img_dir is None:
             raise FileNotFoundError(f"Could not find images directory among {img_dirnames} under {root}")
+
+        # Require labels for train/val splits
+        if split in {"train", "val"} and (lbl_dir is None or not os.path.isdir(lbl_dir)):
+            raise FileNotFoundError(
+                f"Expected labels directory among {lbl_dirnames} under {root} for split='{split}', but none found."
+            )
         has_labels = lbl_dir is not None and os.path.isdir(lbl_dir)
 
+        # ----- robust pairing by Case_<id>_Week<k> -----
         img_paths = sorted(glob.glob(os.path.join(img_dir, "*.nii*")))
         if len(img_paths) == 0:
             raise FileNotFoundError(f"No NIfTI images found under {img_dir}")
 
-        id2img = {os.path.splitext(os.path.basename(p))[0].replace(".nii",""): p for p in img_paths}
+        lbl_paths = sorted(glob.glob(os.path.join(lbl_dir, "*.nii*"))) if has_labels else []
 
-        pairs = []
-        for cid, ipath in id2img.items():
-            if has_labels:
-                candidates = [
-                    os.path.join(lbl_dir, os.path.basename(ipath)),
-                    os.path.join(lbl_dir, cid + ".nii.gz"),
-                    os.path.join(lbl_dir, cid + ".nii"),
-                ]
-                lpath = next((c for c in candidates if os.path.exists(c)), None)
-            else:
-                lpath = None
+        images_by_key: Dict[str, str] = {}
+        for p in img_paths:
+            k = _key_from_name(os.path.basename(p))
+            if not k:
+                continue
+            prev = images_by_key.get(k)
+            # Prefer files that DO NOT look like semantic label when multiple image candidates exist
+            if (prev is None) or ("SEMANTIC" in os.path.basename(prev) and "SEMANTIC" not in os.path.basename(p)):
+                images_by_key[k] = p
+
+        labels_by_key: Dict[str, str] = {}
+        if lbl_paths:
+            for p in lbl_paths:
+                k = _key_from_name(os.path.basename(p))
+                if not k:
+                    continue
+                prev = labels_by_key.get(k)
+                # Prefer files that DO look like labels (contain 'SEMANTIC') if multiples exist
+                if (prev is None) or ("SEMANTIC" in os.path.basename(p) and "SEMANTIC" not in os.path.basename(prev)):
+                    labels_by_key[k] = p
+
+        pairs: List[Tuple[str, Optional[str]]] = []
+        for k, ipath in images_by_key.items():
+            lpath = labels_by_key.get(k) if has_labels else None
             pairs.append((ipath, lpath))
+
+        # Fail loudly if labels are expected but not found (train/val)
+        if has_labels and split != "test":
+            missing = [os.path.basename(i) for i, l in pairs if l is None]
+            if missing:
+                examples = ", ".join(missing[:5])
+                raise FileNotFoundError(
+                    f"Could not match labels for {len(missing)} case(s) using key 'Case_<id>_Week<k>'. "
+                    f"Examples: {examples}"
+                )
 
         self.items = pairs
         self.split = split
@@ -189,6 +234,7 @@ class Prostate3DDataset(Dataset):
         if lbl_path is not None:
             lbl, sp_lbl = load_nii(lbl_path)
         else:
+            # test split without labels: use empty mask
             lbl, sp_lbl = np.zeros_like(img, dtype=np.float32), sp_img
 
         # --- resample (image: linear, label: nearest), using their own spacings
@@ -340,14 +386,15 @@ def soft_dice_per_channel(pred_logits: torch.Tensor, target: torch.Tensor, eps: 
         return torch.tensor(1.0, device=pred_logits.device)
     return torch.stack(dices, dim=1)
 
+
+# -------------------------- alternate convenience for HIP-MRI --------------------------
+
 # at bottom of datasets.py
 from typing import Tuple, List, Dict
 import torch
 from torch.utils.data import DataLoader
 
-# import the class from above in the same file:
-# from .prostate3d import Prostate3DDataset  # if you split files
-# Here we assume Prostate3DDataset is in this file.
+# If you split files, import the class; here we assume Prostate3DDataset is in this file.
 
 def make_loaders_for_hipmri(
     root: str,
@@ -359,8 +406,8 @@ def make_loaders_for_hipmri(
     train_ds = Prostate3DDataset(
         root=root,
         split="train",
-        img_dirnames=("semantic_MRs_anon",),       # <-- your folders
-        lbl_dirnames=("semantic_labels_anon",),    # <-- your folders
+        img_dirnames=("semantic_MRs_anon",),       # adjust to your folder names
+        lbl_dirnames=("semantic_labels_anon",),
         target_spacing=target_spacing,
         crop_to_foreground=True,
         patch_size=patch_size,
@@ -394,4 +441,3 @@ def make_loaders_for_hipmri(
     val_loader   = DataLoader(val_ds,   batch_size=1,       shuffle=False,
                               num_workers=workers, pin_memory=True, collate_fn=collate_pad)
     return train_loader, val_loader
-
