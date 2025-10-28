@@ -1,6 +1,4 @@
-# train.py
 from pathlib import Path
-from datasets import make_loaders_for_hipmri
 import matplotlib.pyplot as plt
 import numpy as np
 import re
@@ -9,13 +7,46 @@ import time
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
-
-from modules import UNet3D
+# keep using CUDA AMP's autocast; it does NOT accept device_type=
+from torch import amp 
 
 # -------------------- dataset discovery --------------------
 
 def find_dataset_root() -> str:
+    """
+    Resolve dataset root that contains BOTH:
+      semantic_MRs_anon/ and semantic_labels_anon/
+    Priority:
+      1) $DATASET_ROOT (if set)
+      2) Google Drive path you showed in Colab
+         /content/drive/MyDrive/Labelled_weekly_MR_images_of_the_male_pelvis-QEzDvqEq-/data
+      3) A recursive search under /content/drive/MyDrive
+      4) Original fallback: scan repo tree near this file
+    """
+    # 1) Environment override
+    env_root = os.getenv("DATASET_ROOT")
+    if env_root:
+        p = Path(env_root)
+        if (p / "semantic_MRs_anon").is_dir() and (p / "semantic_labels_anon").is_dir():
+            return str(p)
+
+    # 2) Your Google Drive dataset path
+    gd_specific = Path("/content/drive/MyDrive/Labelled_weekly_MR_images_of_the_male_pelvis-QEzDvqEq-/data")
+    if (gd_specific / "semantic_MRs_anon").is_dir() and (gd_specific / "semantic_labels_anon").is_dir():
+        return str(gd_specific)
+
+    # 3) Try to find it anywhere under MyDrive (shallow recursive search)
+    mydrive = Path("/content/drive/MyDrive")
+    if mydrive.exists():
+        for cand in mydrive.rglob("*"):
+            if not cand.is_dir():
+                continue
+            img_dir = cand / "semantic_MRs_anon"
+            lbl_dir = cand / "semantic_labels_anon"
+            if img_dir.is_dir() and lbl_dir.is_dir():
+                return str(cand)
+
+    # 4) Original local fallback (repo tree)
     here = Path(__file__).resolve().parent
     for cand in [here, *here.rglob("*")]:
         if not cand.is_dir():
@@ -24,13 +55,19 @@ def find_dataset_root() -> str:
         lbl_dir = cand / "semantic_labels_anon"
         if img_dir.is_dir() and lbl_dir.is_dir():
             return str(cand)
+
     raise FileNotFoundError(
-        "Could not find a folder containing both 'semantic_MRs_anon' and "
-        "'semantic_labels_anon' under: " + str(here)
+        "Could not find dataset root. Tried:\n"
+        f"  $DATASET_ROOT={env_root}\n"
+        f"  {gd_specific}\n"
+        f"  Under {mydrive} (recursive)\n"
+        f"  Near this script: {here}\n"
+        "Make sure Google Drive is mounted and your folders are named "
+        "'semantic_MRs_anon' and 'semantic_labels_anon'.\n"
+        "Alternatively, set:  os.environ['DATASET_ROOT'] = '<absolute_path>'"
     )
 
-# -------------------- viz helpers (5 unique cases) --------------------
-
+# -------------------- (rest of your file stays the same) --------------------
 def case_root(case_id: str) -> str:
     m = re.match(r"^(Case_\d+)", case_id)
     if m:
@@ -179,18 +216,17 @@ def main():
     assert torch.cuda.is_available(), "CUDA GPU not found. In Colab: Runtime → Change runtime type → GPU."
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
-    # (Optional but helpful on Ampere+)
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
         pass
-    torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch 1.12+
+    torch.backends.cuda.matmul.allow_tf32 = True
 
     gpu_name = torch.cuda.get_device_name(0)
     cc_major, cc_minor = torch.cuda.get_device_capability(0)
     print(f"Using GPU: {gpu_name} (CC {cc_major}.{cc_minor})")
 
-    # Choose AMP dtype: bf16 on A100/H100 (CC >= 8.0), else fp16
+    # AMP dtype: bf16 on A100/H100, else fp16
     amp_dtype = torch.bfloat16 if (cc_major >= 8) else torch.float16
     print(f"AMP dtype: {amp_dtype}")
 
@@ -203,17 +239,16 @@ def main():
         target_spacing=(2.0, 2.0, 2.0),
         patch_size=(128, 128, 64),
         batch_size=2,
-        workers=2  # Colab usually handles 2 workers fine
+        workers=2
     )
 
     b = next(iter(train_loader))
     print("Train batch:", b["image"].shape, b["label"].shape, b["id"][:2])
 
-    # Pre-training visualization (saves to disk)
     visualize_5_unique_cases(val_loader, save_path=Path("runs/preview_val_cases.png"))
 
     # --- Model / Optimizer / Loss ---
-    num_classes = 6  # <-- set to your dataset (including background)
+    num_classes = 6  # <-- set for your dataset
     model = UNet3D(in_channels=1, out_channels=num_classes, features=(32,64,128,256,512), dropout=0.1).to(device)
 
     ce_loss = nn.CrossEntropyLoss()
@@ -221,10 +256,10 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
-    scaler = GradScaler(enabled=True)  # CUDA -> True
+    scaler = amp.GradScaler('cuda', enabled=True)
 
     # --- Training config ---
-    epochs = 50
+    epochs =  15
     grad_clip = 1.0
     save_dir = Path("runs/checkpoints")
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -243,11 +278,12 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(device_type="cuda", dtype=amp_dtype):
-                logits = model(imgs)
-                loss_ce = ce_loss(logits, labels)
-                loss_dice = dice_loss(logits, labels)
-                loss = 0.5 * loss_ce + 0.5 * loss_dice
+            # PATCH: use CUDA AMP's autocast WITHOUT device_type=
+            with amp.autocast('cuda', dtype=amp_dtype):
+              logits = model(imgs)
+              loss_ce = ce_loss(logits, labels)
+              loss_dice = dice_loss(logits, labels)
+              loss = 0.5 * loss_ce + 0.5 * loss_dice
 
             scaler.scale(loss).backward()
             if grad_clip is not None:
@@ -288,9 +324,6 @@ def main():
             best_dice = metrics["val_mean_dice_excl_bg"]
             torch.save(ckpt, save_dir / "best.pt")
             print(f"  ↳ New best Dice (excl bg): {best_dice:.4f} — saved to runs/checkpoints/best.pt")
-
-        if epoch % 10 == 0 or epoch == 1:
-            visualize_5_unique_cases(val_loader, save_path=Path(f"runs/val_visual_epoch_{epoch:03d}.png"))
 
     print("Training complete. Best Dice (excl bg):", best_dice)
 
