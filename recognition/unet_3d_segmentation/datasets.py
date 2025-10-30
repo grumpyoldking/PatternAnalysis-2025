@@ -20,7 +20,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import scipy.ndimage as ndi
 
-# -------------------------- Option B: auto-discover dataset root --------------------------
+# -------------------------- Auto-discover dataset root --------------------------
 
 def find_dataset_root() -> str:
     """
@@ -277,7 +277,7 @@ class Prostate3DDataset(Dataset):
             lpath = labels_by_key.get(k) if has_labels else None
             pairs_all.append((ipath, lpath, k))
 
-        # Fail loudly if labels are expected but not found (train/val)
+        # Fail if labels are expected but not found (train/val)
         if has_labels:
             missing = [os.path.basename(i) for i, l, _ in pairs_all if l is None]
             if split != "test" and missing:
@@ -287,7 +287,7 @@ class Prostate3DDataset(Dataset):
                     f"Examples: {examples}"
                 )
 
-        # ----- deterministic 70:15:15 split (by case root if requested) -----
+        # ----- deterministic 70:15:15 split -----
         # Gather groups (either case-root groups or individual keys)
         if group_by_case:
             groups: Dict[str, List[Tuple[str, Optional[str], str]]] = {}

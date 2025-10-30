@@ -3,7 +3,6 @@ import argparse
 from pathlib import Path
 import os
 import re
-import sys
 import numpy as np
 import torch
 from torch import amp
@@ -14,7 +13,13 @@ import torch.nn as nn
 # -------------------- helpers --------------------
 
 def find_dataset_root() -> str:
-    # Mirror train.py behavior, but allow override via env
+    """
+    Locate dataset root that contains semantic_MRs_anon/ (and ideally semantic_labels_anon/).
+    Priority:
+      1) DATASET_ROOT env var
+      2) Known Google Drive path (Colab)
+      3) Scan the current repo tree
+    """
     env_root = os.getenv("DATASET_ROOT")
     if env_root and (Path(env_root) / "semantic_MRs_anon").is_dir():
         return env_root
@@ -23,226 +28,68 @@ def find_dataset_root() -> str:
     if (gd_specific / "semantic_MRs_anon").is_dir():
         return str(gd_specific)
 
-    # fallback: current folder tree
     here = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
     for cand in [here, *here.rglob("*")]:
         if not cand.is_dir():
             continue
         if (cand / "semantic_MRs_anon").is_dir() and (cand / "semantic_labels_anon").is_dir():
             return str(cand)
+
     raise FileNotFoundError("Dataset root not found. Set DATASET_ROOT or mount Google Drive.")
 
 def case_root(case_id: str) -> str:
+    """Reduce 'Case_004_Week0' → 'Case_004' for grouping / pretty printing."""
     m = re.match(r"^(Case_\d+)", case_id)
     return m.group(1) if m else case_id.split("_")[0]
 
-def window_img(x):
+def window_img(x: np.ndarray):
+    """Window to [2nd,98th] percentiles and normalize to [0,1] for visualization."""
     p2, p98 = np.percentile(x, (2, 98))
     return np.clip((x - p2) / (p98 - p2 + 1e-6), 0, 1)
 
 def best_slice(lbl_3d: np.ndarray) -> int:
+    """
+    Choose an axial slice index that maximizes foreground area;
+    fall back to the middle slice if the mask is empty.
+    """
     area = (lbl_3d > 0).reshape(lbl_3d.shape[0], -1).sum(axis=1)
     return int(area.argmax()) if area.max() > 0 else lbl_3d.shape[0] // 2
 
 def save_nii_mask(mask_dhw: np.ndarray, spacing_dhw, out_path: Path):
-    """Save integer prediction (D,H,W) as NIfTI with diagonal affine using spacing."""
+    """
+    Save integer (D,H,W) prediction as NIfTI, using a diagonal affine derived from spacing.
+    NOTE: This assumes canonical axis order and ignores orientation (sufficient for quick export).
+    """
     Dz, Dy, Dx = [float(s) for s in spacing_dhw]
-    affine = np.diag([Dx, Dy, Dz, 1.0])  # simple spacing-only affine
-    data_xyz = np.transpose(mask_dhw, (2, 1, 0)).astype(np.int16, copy=False)  # (D,H,W)->(X,Y,Z)
+    affine = np.diag([Dx, Dy, Dz, 1.0])  # spacing along X,Y,Z; homogeneous coord in last column
+    data_xyz = np.transpose(mask_dhw, (2, 1, 0)).astype(np.int16, copy=False)  # (D,H,W) -> (X,Y,Z)
     nib.save(nib.Nifti1Image(data_xyz, affine), str(out_path))
 
 # -------------------- Improved UNet (3D) --------------------
-# Residual blocks + SCSE attention + attention-gated skips + learnable down/upsampling
-
-class ConvNormAct3d(nn.Module):
-    def __init__(self, in_ch, out_ch, k=3, s=1, p=1, groups=8, act="silu"):
-        super().__init__()
-        self.conv = nn.Conv3d(in_ch, out_ch, k, s, p, bias=False)
-        self.norm = nn.GroupNorm(num_groups=min(groups, out_ch), num_channels=out_ch)
-        if act == "silu":
-            self.act = nn.SiLU(inplace=True)
-        elif act == "lrelu":
-            self.act = nn.LeakyReLU(0.1, inplace=True)
-        else:
-            self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        return self.act(self.norm(self.conv(x)))
-
-class ResBlock3d(nn.Module):
-    def __init__(self, in_ch, out_ch, mid_ch=None, dropout=0.0, groups=8, act="silu"):
-        super().__init__()
-        mid_ch = mid_ch or out_ch
-        self.conv1 = ConvNormAct3d(in_ch, mid_ch, k=3, s=1, p=1, groups=groups, act=act)
-        self.drop = nn.Dropout3d(p=dropout) if dropout and dropout > 0 else nn.Identity()
-        self.conv2 = ConvNormAct3d(mid_ch, out_ch, k=3, s=1, p=1, groups=groups, act=act)
-        self.proj = nn.Identity() if in_ch == out_ch else nn.Conv3d(in_ch, out_ch, 1, bias=False)
-
-    def forward(self, x):
-        y = self.conv1(x)
-        y = self.drop(y)
-        y = self.conv2(y)
-        return y + self.proj(x)
-
-class SCSE3d(nn.Module):
-    def __init__(self, ch, r=16):
-        super().__init__()
-        red = max(ch // r, 1)
-        self.cse_avg = nn.AdaptiveAvgPool3d(1)
-        self.cse_fc = nn.Sequential(
-            nn.Conv3d(ch, red, 1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(red, ch, 1, bias=True),
-            nn.Sigmoid(),
-        )
-        self.sse = nn.Sequential(nn.Conv3d(ch, 1, 1, bias=True), nn.Sigmoid())
-
-    def forward(self, x):
-        c = self.cse_fc(self.cse_avg(x))
-        s = self.sse(x)
-        return x * c + x * s
-
-class AttGate3d(nn.Module):
-    def __init__(self, in_skip, in_g, inter):
-        super().__init__()
-        self.theta = nn.Conv3d(in_skip, inter, 1, bias=False)
-        self.phi   = nn.Conv3d(in_g,    inter, 1, bias=False)
-        self.act   = nn.ReLU(inplace=True)
-        self.psi   = nn.Sequential(nn.Conv3d(inter, 1, 1, bias=True), nn.Sigmoid())
-
-    def forward(self, skip, g):
-        if skip.shape[2:] != g.shape[2:]:
-            g = nn.functional.interpolate(g, size=skip.shape[2:], mode="trilinear", align_corners=False)
-        a = self.act(self.theta(skip) + self.phi(g))
-        att = self.psi(a)
-        return skip * att
-
-class DownBlock3d(nn.Module):
-    def __init__(self, in_ch, out_ch, dropout=0.0, groups=8, act="silu"):
-        super().__init__()
-        self.down = nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False)
-        self.norm = nn.GroupNorm(num_groups=min(groups, out_ch), num_channels=out_ch)
-        self.act  = nn.SiLU(inplace=True) if act == "silu" else nn.ReLU(inplace=True)
-        self.block = ResBlock3d(out_ch, out_ch, dropout=dropout, groups=groups, act=act)
-        self.scse  = SCSE3d(out_ch)
-
-    def forward(self, x):
-        x = self.act(self.norm(self.down(x)))
-        x = self.block(x)
-        x = self.scse(x)
-        return x
-
-class UpBlock3d(nn.Module):
-    def __init__(self, in_ch, skip_ch, out_ch, dropout=0.0, groups=8, act="silu", up_mode="trilinear"):
-        super().__init__()
-        self.up_mode = up_mode
-        if up_mode == "deconv":
-            self.up = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=2, stride=2, bias=False)
-            up_out = out_ch
-        else:
-            self.up = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
-            self.reduce = nn.Conv3d(in_ch, out_ch, 1, bias=False)
-            up_out = out_ch
-        self.gate = AttGate3d(skip_ch, up_out, inter=max(out_ch // 2, 8))
-        self.fuse = ResBlock3d(out_ch + skip_ch, out_ch, dropout=dropout, groups=groups, act=act)
-        self.scse = SCSE3d(out_ch)
-
-    def forward(self, x, skip):
-        if self.up_mode == "deconv":
-            x = self.up(x)
-        else:
-            x = self.reduce(self.up(x))
-        skip = self.gate(skip, x)
-        x = torch.cat([x, skip], dim=1)
-        x = self.fuse(x)
-        x = self.scse(x)
-        return x
-
-class ImprovedUNet3D(nn.Module):
-    def __init__(
-        self,
-        in_channels: int = 1,
-        out_channels: int = 2,
-        features=(32, 64, 128, 256, 512),
-        dropout: float = 0.1,
-        groups: int = 8,
-        act: str = "silu",
-        up_mode: str = "trilinear",
-        deep_supervision: bool = False,
-    ):
-        super().__init__()
-        assert len(features) >= 4, "Use at least 4 stages for 3D volumes."
-        self.deep_supervision = deep_supervision
-        chans = list(features)
-
-        self.stem = ResBlock3d(in_channels, chans[0], dropout=dropout, groups=groups, act=act)
-        self.stem_scse = SCSE3d(chans[0])
-
-        self.enc = nn.ModuleList()
-        for i in range(len(chans) - 1):
-            self.enc.append(DownBlock3d(chans[i], chans[i+1], dropout=dropout, groups=groups, act=act))
-
-        self.dec = nn.ModuleList()
-        for i in reversed(range(len(chans) - 1)):
-            in_ch  = chans[i+1]
-            skip_ch= chans[i]
-            out_ch = chans[i]
-            self.dec.append(UpBlock3d(in_ch, skip_ch, out_ch, dropout=dropout, groups=groups, act=act, up_mode=up_mode))
-
-        self.head = nn.Conv3d(chans[0], out_channels, 1, bias=True)
-
-        if deep_supervision:
-            self.aux_heads = nn.ModuleList([
-                nn.Conv3d(chans[i], out_channels, 1, bias=True) for i in range(1, len(chans))
-            ])
-
-    def forward(self, x):
-        s0 = self.stem_scse(self.stem(x))
-        feats = [s0]
-        y = s0
-        for down in self.enc:
-            y = down(y)
-            feats.append(y)
-
-        aux = []
-        for i, up in enumerate(self.dec):
-            skip = feats[-(i+2)]
-            y = up(y, skip)
-            if self.deep_supervision and i < len(self.dec) - 1:
-                aux.append(y)
-
-        logits = self.head(y)
-        if not self.deep_supervision:
-            return logits
-
-        aux_logits = []
-        for i, y_i in enumerate(aux):
-            scale = 2 ** (i + 1)
-            up = nn.functional.interpolate(y_i, scale_factor=scale, mode="trilinear", align_corners=False)
-            aux_logits.append(self.aux_heads[-(i+2)](up))
-        return logits, aux_logits
+# (Assumes ImprovedUNet3D is already defined in the notebook.)
 
 # -------------------- Dice evaluator (mean per class over set) --------------------
 
 @torch.no_grad()
 def dice_report(model, loader, device, num_classes: int, amp_dtype, label_names=None, threshold=0.7):
     """
-    Computes mean Dice per class across the dataset.
-    - Skips items where a class is absent in GT (denominator==0).
-    - Prints a summary and returns a dict.
+    Compute mean Dice per class across the provided loader.
+    - Skips samples where a class is absent in the GT (denominator==0).
+    - Prints a PASS/FAIL using the minimum foreground Dice vs threshold.
     """
     model.eval()
-    sums = torch.zeros(num_classes, device=device)
-    cnts = torch.zeros(num_classes, device=device)
+    sums = torch.zeros(num_classes, device=device)  # sum of per-batch dice per class
+    cnts = torch.zeros(num_classes, device=device)  # number of batches contributing to each class
 
     for batch in loader:
         imgs   = batch["image"].to(device, non_blocking=True)              # [B,1,D,H,W]
         labels = batch["label"][:,0].long().to(device, non_blocking=True)  # [B,D,H,W]
         with amp.autocast('cuda', dtype=amp_dtype):
             out = model(imgs)
-            logits = out[0] if isinstance(out, (tuple, list)) else out     # handle deep supervision
+            logits = out[0] if isinstance(out, (tuple, list)) else out     # support deep supervision
         pred = torch.argmax(logits, dim=1)                                  # [B,D,H,W]
 
+        # Per-class Dice accumulation
         for c in range(num_classes):
             p = (pred == c).float()
             t = (labels == c).float()
@@ -259,7 +106,7 @@ def dice_report(model, loader, device, num_classes: int, amp_dtype, label_names=
     per_class_no_bg = per_class[1:] if num_classes > 1 else per_class
     min_no_bg = float(min(per_class_no_bg)) if per_class_no_bg else 0.0
 
-    # Pretty print
+    # Human-readable summary
     print("\n=== Dice report (mean over set) ===")
     for c in range(num_classes):
         name = (label_names.get(c, f"class_{c}") if isinstance(label_names, dict) else f"class_{c}")
@@ -284,6 +131,13 @@ def dice_report(model, loader, device, num_classes: int, amp_dtype, label_names=
 # -------------------- main --------------------
 
 def main():
+    """
+    Predict masks on the TEST split:
+      - Uses ImprovedUNet3D (already defined in notebook) and loaded weights
+      - Iterates over full volumes (padded) from the dataset
+      - Saves NIfTI predictions and optional 2D overlays
+      - Prints a dataset-level Dice report vs threshold
+    """
     ap = argparse.ArgumentParser(description="Improved 3D U-Net inference (TEST split)")
     ap.add_argument("--ckpt", type=str, default="runs/checkpoints/best.pt",
                     help="Path to checkpoint .pt (default: runs/checkpoints/best.pt)")
@@ -292,23 +146,21 @@ def main():
     ap.add_argument("--num-classes", type=int, default=6,
                     help="Number of output classes (incl. background)")
     ap.add_argument("--viz", type=int, default=5, help="How many overlays to save (0 to disable)")
-    ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--workers", type=int, default=2, help="DataLoader workers")
     ap.add_argument("--threshold", type=float, default=0.70,
                     help="Dice threshold to pass (excluding background)")
-    # tolerate extra IPython args like "-f <kernel.json>"
-    args, _unknown = ap.parse_known_args()
+    args, _unknown = ap.parse_known_args()  # tolerate extra IPython args in Colab
 
-    # CUDA / AMP
+    # ---- CUDA / AMP ----
     assert torch.cuda.is_available(), "CUDA GPU not found."
     device = torch.device("cuda")
     cc_major, _ = torch.cuda.get_device_capability(0)
-    amp_dtype = torch.bfloat16 if cc_major >= 8 else torch.float16
+    amp_dtype = torch.bfloat16 if cc_major >= 8 else torch.float16  # bf16 on Ampere+, else fp16
 
-    # ---------------- Data: TEST split (full volumes, padded) ----------------
+    # ---- Data: TEST split (full volumes, padded) ----
     root = find_dataset_root()
-    if Prostate3DDataset is None:
-        raise RuntimeError("Import Prostate3DDataset from dataloaders.prostate3d failed. Ensure your PYTHONPATH includes the repo root.")
 
+    # NOTE: Prostate3DDataset is assumed to be defined in the same notebook/session.
     test_ds = Prostate3DDataset(
         root=root,
         split="test",
@@ -316,11 +168,12 @@ def main():
         lbl_dirnames=("semantic_labels_anon", "labels", "labelsTr"),
         target_spacing=(2.0, 2.0, 2.0),
         crop_to_foreground=False,
-        patch_size=None,              # full volume (padded inside dataset)
+        patch_size=None,              # full volume (dataset handles pad-to-multiple)
         augment=False,
         for_eval_full_volume=True
     )
 
+    # Minimal collate: just stack tensors and carry metadata
     def collate_pad(batch):
         return {
             "image": torch.stack([b["image"] for b in batch], dim=0),
@@ -333,10 +186,10 @@ def main():
         test_ds, batch_size=1, shuffle=False,
         num_workers=args.workers, pin_memory=True, collate_fn=collate_pad
     )
-
     print(f"Discovered TEST set cases: {len(test_ds)} (volumes)")
 
-    # ---------------- Model (match training config) ----------------
+    # ---- Model (mirror training config) ----
+    # NOTE: ImprovedUNet3D is assumed to be defined in the same notebook/session.
     model = ImprovedUNet3D(
         in_channels=1,
         out_channels=args.num_classes,
@@ -348,48 +201,52 @@ def main():
         deep_supervision=False
     ).to(device)
 
+    # Load weights (tolerate checkpoints that store either full dict or state_dict)
     ckpt = torch.load(args.ckpt, map_location="cpu")
-    state = ckpt.get("model", ckpt)  # tolerate state_dict at top-level
+    state = ckpt.get("model", ckpt)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         print("load_state_dict notes:", {"missing": missing, "unexpected": unexpected})
     model.eval()
 
+    # Prepare output folders
     outdir = Path(args.outdir)
     (outdir / "nii").mkdir(parents=True, exist_ok=True)
     (outdir / "viz").mkdir(parents=True, exist_ok=True)
 
-    # ---------------- Inference pass (saves nii + optional overlays) ----------------
+    # ---- Inference: write NIfTIs + optional overlays ----
     count = 0
     with torch.no_grad():
         for batch in test_loader:
             imgs = batch["image"].to(device, non_blocking=True)      # [1,1,D,H,W]
             spacing = batch["spacing"][0].cpu().numpy()              # (Dz,Dy,Dx)
             cid = batch["id"][0]
+
+            # Mixed-precision forward; handle (logits, aux) when deep_supervision=True
             with amp.autocast('cuda', dtype=amp_dtype):
-                out = model(imgs)                                    # logits or (logits, aux)
+                out = model(imgs)
                 logits = out[0] if isinstance(out, (tuple, list)) else out
                 pred = torch.argmax(logits, dim=1).squeeze(0)        # [D,H,W]
             pred_np = pred.cpu().numpy()
 
-            # Save NIfTI
+            # Save as NIfTI (.nii.gz)
             out_nii = outdir / "nii" / f"{cid}_pred.nii.gz"
             save_nii_mask(pred_np, spacing, out_nii)
             print(f"Saved: {out_nii}")
 
-            # Optional overlays (first N cases)
+            # Save quicklook overlays for the first N cases
             if count < args.viz:
                 vol = batch["image"][0, 0].cpu().numpy()             # [D,H,W]
                 gt  = batch["label"][0, 0].cpu().numpy().astype(int) # [D,H,W]
 
-                # choose a slice with GT content when possible
+                # Choose a slice with GT if possible, else use pred-based heuristic
                 z = best_slice(gt if gt.max() > 0 else pred_np)
 
                 sl = window_img(vol[z])
                 gt_sl = gt[z]
                 pr_sl = pred_np[z]
 
-                # --- 3-panel: image+GT, image+Pred, contours ---
+                # --- 3-panel: image+GT, image+Pred, contours+slice Dice ---
                 plt.figure(figsize=(12, 3.4))
                 ax1 = plt.subplot(1, 3, 1); ax1.imshow(sl, cmap="gray"); ax1.axis("off"); ax1.set_title(f"{cid} | GT (z={z})")
                 ax1.imshow(np.ma.masked_where(gt_sl == 0, gt_sl), alpha=0.45, cmap="tab20")
@@ -397,7 +254,7 @@ def main():
                 ax2 = plt.subplot(1, 3, 2); ax2.imshow(sl, cmap="gray"); ax2.axis("off"); ax2.set_title("Prediction")
                 ax2.imshow(np.ma.masked_where(pr_sl == 0, pr_sl), alpha=0.45, cmap="tab20")
 
-                # quick slice Dice (excluding background)
+                # Quick Dice on that slice (foreground only)
                 pr_flat = pr_sl.reshape(-1)
                 gt_flat = gt_sl.reshape(-1)
                 nonbg = gt_flat > 0
@@ -422,7 +279,7 @@ def main():
                 plt.savefig(png_path, dpi=150, bbox_inches="tight"); plt.close()
                 print(f"Saved: {png_path}")
 
-                # simpler two-panel overlay
+                # Simpler two-panel overlay (GT vs Pred)
                 plt.figure(figsize=(6, 3.2))
                 ax = plt.subplot(1, 2, 1); ax.imshow(sl, cmap="gray"); ax.axis("off"); ax.set_title("GT")
                 ax.imshow(np.ma.masked_where(gt_sl == 0, gt_sl), alpha=0.45, cmap="tab20")
@@ -435,7 +292,7 @@ def main():
 
             count += 1
 
-    # ---------------- Dice requirement check (TEST set) ----------------
+    # ---- Dataset-level Dice check (TEST set) ----
     report = dice_report(
         model=model,
         loader=test_loader,
@@ -445,7 +302,6 @@ def main():
         label_names={0: "class 0", 1: "class 1", 2: "class 2", 3: "class 3", 4: "class 4", 5: "class 5"},
         threshold=args.threshold
     )
-
     print("Done. Pass requirement (TEST):", report["pass"])
 
 if __name__ == "__main__":

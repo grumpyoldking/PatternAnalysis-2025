@@ -7,46 +7,41 @@ import time
 
 import torch
 import torch.nn as nn
-# Keep using CUDA AMP's autocast; it does NOT accept device_type=
-from torch import amp 
+from torch import amp
+
+# NOTE: this script assumes the following are available elsewhere in your project:
+#   from dataloaders.prostate3d import make_loaders_for_hipmri
+#   from models.improved_unet3d import ImprovedUNet3D
+# Import them at the top of your actual file:
+# from dataloaders.prostate3d import make_loaders_for_hipmri
+# from models.improved_unet3d import ImprovedUNet3D
 
 # -------------------- dataset discovery --------------------
 
 def find_dataset_root() -> str:
     """
-    Resolve dataset root that contains BOTH folders:
+    Try multiple locations to find a dataset root that contains both:
       - semantic_MRs_anon/
       - semantic_labels_anon/
-
-    Search priority:
-      1) $DATASET_ROOT (if set and valid)
-      2) Specific Google Drive path (as used in Colab)
+    Priority order:
+      1) $DATASET_ROOT (explicit, preferred)
+      2) Known Google Drive path used in Colab
       3) Recursive search under /content/drive/MyDrive
-      4) Fallback: walk near this file
-
-    Returns
-    -------
-    str
-        Absolute path to dataset root.
-
-    Raises
-    ------
-    FileNotFoundError
-        If none of the search strategies find a valid root.
+      4) Search near this script in the repo
     """
-    # 1) Environment override
+    # 1) Environment override for reproducibility and CI-friendly usage
     env_root = os.getenv("DATASET_ROOT")
     if env_root:
         p = Path(env_root)
         if (p / "semantic_MRs_anon").is_dir() and (p / "semantic_labels_anon").is_dir():
             return str(p)
 
-    # 2) Your Google Drive dataset path (adjust as needed)
+    # 2) Specific Google Drive path that you used previously in Colab
     gd_specific = Path("/content/drive/MyDrive/Labelled_weekly_MR_images_of_the_male_pelvis-QEzDvqEq-/data")
     if (gd_specific / "semantic_MRs_anon").is_dir() and (gd_specific / "semantic_labels_anon").is_dir():
         return str(gd_specific)
 
-    # 3) Try to find it anywhere under MyDrive (shallow recursive search)
+    # 3) Broader search within Drive (can be slow)
     mydrive = Path("/content/drive/MyDrive")
     if mydrive.exists():
         for cand in mydrive.rglob("*"):
@@ -57,7 +52,7 @@ def find_dataset_root() -> str:
             if img_dir.is_dir() and lbl_dir.is_dir():
                 return str(cand)
 
-    # 4) Original local fallback (repo tree)
+    # 4) Last resort: search relative to this file (local dev)
     here = Path(__file__).resolve().parent
     for cand in [here, *here.rglob("*")]:
         if not cand.is_dir():
@@ -67,23 +62,14 @@ def find_dataset_root() -> str:
         if img_dir.is_dir() and lbl_dir.is_dir():
             return str(cand)
 
-    # Helpful error message if all strategies fail
-    raise FileNotFoundError(
-        "Could not find dataset root. Tried:\n"
-        f"  $DATASET_ROOT={env_root}\n"
-        f"  {gd_specific}\n"
-        f"  Under {mydrive} (recursive)\n"
-        f"  Near this script: {here}\n"
-        "Make sure Google Drive is mounted and your folders are named "
-        "'semantic_MRs_anon' and 'semantic_labels_anon'.\n"
-        "Alternatively, set:  os.environ['DATASET_ROOT'] = '<absolute_path>'"
-    )
+    # If we got here, nothing matched — fail loudly with guidance
+    raise FileNotFoundError("Dataset root not found; set DATASET_ROOT or mount Drive with expected folders.")
 
-# -------------------- (rest of your file stays the same) --------------------
+# -------------------- (helpers) --------------------
 def case_root(case_id: str) -> str:
     """
-    Reduce a full case ID to a root (e.g., 'Case_004_Week0_...' -> 'Case_004').
-    If pattern not matched, returns first two underscore-chunks or raw ID.
+    Collapse a Case_XXX_WeekY id down to its case root 'Case_XXX' for grouping.
+    If the pattern is unusual, fall back to the first two underscore-separated tokens.
     """
     m = re.match(r"^(Case_\d+)", case_id)
     if m:
@@ -93,32 +79,32 @@ def case_root(case_id: str) -> str:
 
 def pick_best_slice(img_dhw: np.ndarray, lbl_dhw: np.ndarray) -> int:
     """
-    Pick axial slice index with max labeled area; fallback to mid-slice if empty.
-    img_dhw, lbl_dhw: arrays shaped [D,H,W].
+    Heuristic to pick a representative axial slice index:
+    choose the slice with the maximal number of labeled voxels;
+    if no labels exist, choose the middle slice.
     """
     area = (lbl_dhw > 0).reshape(lbl_dhw.shape[0], -1).sum(axis=1)
     return int(area.argmax()) if area.max() > 0 else img_dhw.shape[0] // 2
 
 def window_img(x: np.ndarray):
     """
-    Percentile windowing (2–98%) then scale to [0,1] for visualization.
+    Simple intensity windowing for display:
+    map [2nd, 98th] percentiles to [0,1] and clamp.
     """
     p2, p98 = np.percentile(x, (2, 98))
     return np.clip((x - p2) / (p98 - p2 + 1e-6), 0, 1)
 
 def visualize_5_unique_cases(val_loader, save_path: Path | None = None):
     """
-    Visualize up to 5 unique cases from the validation loader (by case_root):
-      - Left: raw image slice
-      - Right: overlayed label (mask + contour)
-
-    Notes
-    -----
-    Assumes each batch is a dict with:
-      'image': [B,1,D,H,W], 'label': [B,1,D,H,W], 'id': list[str]
+    Fetch up to 5 unique case roots from the validation loader and visualize:
+      - left: grayscale slice
+      - right: same slice with label overlay and contour
+    If save_path is provided, save the figure; otherwise, show it.
     """
     unique_samples = []
     seen_roots = set()
+
+    # Collect first 5 distinct case roots
     for sample in val_loader:
         cid_full = sample["id"][0]
         root_id = case_root(cid_full)
@@ -138,31 +124,32 @@ def visualize_5_unique_cases(val_loader, save_path: Path | None = None):
 
     fig, axes = plt.subplots(nrows=n, ncols=2, figsize=(10, 2.4 * n))
     if n == 1:
-        axes = np.array([axes])
+        axes = np.array([axes])  # normalize to 2D array for indexing
 
     for row, sample in enumerate(unique_samples):
+        # Each 'sample' is a collated batch of size 1 from the val loader
         img = sample["image"][0, 0].cpu().numpy()               # [D,H,W]
         lbl = sample["label"][0, 0].cpu().numpy().astype(int)   # [D,H,W]
         case_id = sample["id"][0]
         root_id = case_root(case_id)
 
-        # Quick label histogram (debugging coverage, class presence)
+        # Print class histogram info for the chosen volume
         uniq, counts = np.unique(lbl, return_counts=True)
         print(f"[{row+1}/{n}] {root_id} ({case_id}) | labels ->",
               {int(u): int(c) for u, c in zip(uniq, counts)})
 
-        # Choose a representative slice
+        # Choose slice and prep overlays
         z = pick_best_slice(img, lbl)
         sl_disp = window_img(img[z])
         lbl_slice = lbl[z]
 
-        # raw image
+        # Left: grayscale
         ax1 = axes[row, 0]
         ax1.imshow(sl_disp, cmap="gray")
         ax1.set_title(f"{root_id} | z={z} (no overlay)", fontsize=9)
         ax1.axis("off")
 
-        # image + label overlay (with contours)
+        # Right: grayscale + colored labels + contour
         ax2 = axes[row, 1]
         ax2.imshow(sl_disp, cmap="gray")
         lbl_masked = np.ma.masked_where(lbl_slice == 0, lbl_slice)
@@ -175,25 +162,21 @@ def visualize_5_unique_cases(val_loader, save_path: Path | None = None):
 
     plt.tight_layout()
     if save_path is not None:
+        # Save to disk (create parent dir if needed)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"Saved viz to: {save_path}")
         plt.close(fig)
     else:
+        # Display inline (e.g., in notebooks)
         plt.show()
 
 # -------------------- losses & metrics --------------------
 
 class DiceLoss(nn.Module):
     """
-    Multi-class Dice loss computed on softmax probabilities vs one-hot labels.
-
-    Parameters
-    ----------
-    eps : float
-        Numerical stability term.
-    ignore_background : bool
-        If True and C>1, ignore channel 0 (background) in the loss.
+    Multi-class soft Dice loss.
+    Optionally ignore background channel when computing the mean (set ignore_background=True).
     """
     def __init__(self, eps: float = 1e-6, ignore_background: bool = False):
         super().__init__()
@@ -202,20 +185,20 @@ class DiceLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
-        Parameters
-        ----------
-        logits : FloatTensor [N, C, D, H, W]
-            Model logits.
-        target : LongTensor  [N, D, H, W]
-            Integer labels (0..C-1).
+        Args:
+          logits: [B, C, D, H, W] unnormalized scores
+          target: [B, D, H, W] integer labels in [0..C-1]
+        Returns:
+          scalar Dice loss
         """
-        probs = torch.softmax(logits, dim=1)
+        probs = torch.softmax(logits, dim=1)            # [B,C,D,H,W]
         N, C = probs.shape[:2]
-        # one_hot : [N, C, D, H, W]
+        # One-hot encode targets to [B,C,D,H,W]
         one_hot = torch.zeros_like(probs).scatter_(1, target.unsqueeze(1), 1)
 
+        # Optionally drop background for loss averaging
         start_c = 1 if self.ignore_background and C > 1 else 0
-        dims = (0, 2, 3, 4)  # reduce over batch + spatial dims
+        dims = (0, 2, 3, 4)                              # sum over batch + spatial
         inter = (probs[:, start_c:] * one_hot[:, start_c:]).sum(dim=dims)
         den   = probs[:, start_c:].sum(dim=dims) + one_hot[:, start_c:].sum(dim=dims)
         dice = (2 * inter + self.eps) / (den + self.eps)
@@ -224,17 +207,13 @@ class DiceLoss(nn.Module):
 @torch.no_grad()
 def evaluate(model, val_loader, device, num_classes: int):
     """
-    Validation loop:
-      - CE and Dice losses across val set
-      - Per-class hard Dice (argmax) aggregated over items
-      - Returns dict with summary metrics
-
-    Assumes val_loader yields dicts:
-      'image': [B,1,D,H,W], 'label': [B,1,D,H,W]
+    Evaluation loop:
+      - Computes mean CE and DiceLoss on val set
+      - Reports per-class Dice (including background) and mean Dice excluding background
     """
     model.eval()
-    dices_sum = torch.zeros(num_classes, device=device)
-    dices_cnt = torch.zeros(num_classes, device=device)
+    dices_sum = torch.zeros(num_classes, device=device)   # accumulate per-class dice
+    dices_cnt = torch.zeros(num_classes, device=device)   # count of batches with class present
     ce_loss = nn.CrossEntropyLoss()
     dice_loss = DiceLoss(ignore_background=False)
 
@@ -243,15 +222,18 @@ def evaluate(model, val_loader, device, num_classes: int):
     n_batches = 0
 
     for batch in val_loader:
-        imgs = batch["image"].to(device, non_blocking=True)           # [B,1,D,H,W]
+        imgs = batch["image"].to(device, non_blocking=True)         # [B,1,D,H,W]
         labels = batch["label"][:, 0].long().to(device, non_blocking=True)  # [B,D,H,W]
 
-        logits = model(imgs)                                          # [B,C,D,H,W]
+        # Forward pass
+        logits = model(imgs)
+
+        # Accumulate scalar losses
         tot_ce += ce_loss(logits, labels).item()
         tot_dice += dice_loss(logits, labels).item()
         n_batches += 1
 
-        # Hard predictions for simple per-class Dice
+        # Hard prediction for Dice reporting (argmax over classes)
         pred = torch.argmax(logits, dim=1)  # [B,D,H,W]
         for c in range(num_classes):
             p = (pred == c).float()
@@ -263,9 +245,12 @@ def evaluate(model, val_loader, device, num_classes: int):
                 dices_sum[c] += dice_c
                 dices_cnt[c] += 1
 
+    # Mean over batches
     mean_ce = tot_ce / max(n_batches, 1)
     mean_dice_loss = tot_dice / max(n_batches, 1)
+    # Average only over batches where the class appears (avoid div by 0)
     per_class_dice = torch.where(dices_cnt > 0, dices_sum / dices_cnt.clamp_min(1), torch.zeros_like(dices_sum))
+    # Commonly report mean dice across foreground classes only
     mean_dice = per_class_dice[1:].mean().item() if num_classes > 1 else per_class_dice.mean().item()
 
     return {
@@ -279,30 +264,30 @@ def evaluate(model, val_loader, device, num_classes: int):
 
 def main():
     """
-    End-to-end training:
-      - GPU + AMP setup
-      - Data loaders (HIP-MRI)
-      - Model creation (UNet3D)
-      - Losses: CE + Dice
-      - Optimizer: AdamW + cosine LR
-      - AMP scaler + grad clipping
-      - Validation + checkpointing (last & best)
+    Full training entry point:
+      - CUDA/AMP initialization
+      - Data loaders
+      - Model/optimizer/loss setup
+      - Train/validate loop with checkpointing
     """
-    # --- CUDA / Colab setup ---
-    assert torch.cuda.is_available(), "CUDA GPU not found. In Colab: Runtime → Change runtime type → GPU."
+    # Require a CUDA device for 3D volumes (training will be slow on CPU)
+    assert torch.cuda.is_available(), "CUDA GPU not found."
     device = torch.device("cuda")
-    torch.backends.cudnn.benchmark = True  # enables autotuner for fixed sizes
+
+    # Speed heuristics for convnets
+    torch.backends.cudnn.benchmark = True
     try:
-        torch.set_float32_matmul_precision("high")  # improves matmul perf on recent GPUs
+        torch.set_float32_matmul_precision("high")  # PyTorch 2.0+ optional
     except Exception:
         pass
-    torch.backends.cuda.matmul.allow_tf32 = True   # allow TF32 for faster matmuls on Ampere+
+    torch.backends.cuda.matmul.allow_tf32 = True     # allow TF32 on Ampere+ for speed
 
+    # Report device info and choose AMP dtype
     gpu_name = torch.cuda.get_device_name(0)
     cc_major, cc_minor = torch.cuda.get_device_capability(0)
     print(f"Using GPU: {gpu_name} (CC {cc_major}.{cc_minor})")
 
-    # AMP dtype: bf16 on A100/H100 (CC>=8), else fp16
+    # bf16 is best on Ampere+; otherwise fall back to fp16
     amp_dtype = torch.bfloat16 if (cc_major >= 8) else torch.float16
     print(f"AMP dtype: {amp_dtype}")
 
@@ -310,7 +295,7 @@ def main():
     root = find_dataset_root()
     print("Dataset root:", root)
 
-    # NOTE: make_loaders_for_hipmri must exist in your codebase.
+    # Build train/val loaders (HIP-MRI folder names + fixed spacing)
     train_loader, val_loader = make_loaders_for_hipmri(
         root=root,
         target_spacing=(2.0, 2.0, 2.0),
@@ -319,31 +304,39 @@ def main():
         workers=2
     )
 
-    # Sanity check one batch to verify shapes and IDs
+    # Peek at a single batch to verify shapes
     b = next(iter(train_loader))
     print("Train batch:", b["image"].shape, b["label"].shape, b["id"][:2])
 
-    # Quick qualitative preview from the val set (saves PNG)
+    # Quick qualitative sanity check: save a small panel of val cases
     visualize_5_unique_cases(val_loader, save_path=Path("runs/preview_val_cases.png"))
 
     # --- Model / Optimizer / Loss ---
-    num_classes = 6  # <-- set for your dataset (including background=0)
-    # NOTE: If you've switched to ImprovedUNet3D elsewhere, replace UNet3D with that class here.
-    model = UNet3D(in_channels=1, out_channels=num_classes, features=(32,64,128,256,512), dropout=0.1).to(device)
+    num_classes = 6  # <-- adjust to your dataset's label count (incl. background class 0)
+    model = ImprovedUNet3D(
+        in_channels=1,
+        out_channels=num_classes,
+        features=(32, 64, 128, 256, 512),  # reduce if VRAM is tight
+        dropout=0.1,
+        groups=8,
+        act="silu",
+        up_mode="trilinear",
+        deep_supervision=False             # keep False to avoid changing the loss loop
+    ).to(device)
 
     ce_loss = nn.CrossEntropyLoss()
     dice_loss = DiceLoss(ignore_background=False)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
-    scaler = amp.GradScaler('cuda', enabled=True)  # AMP gradient scaler
+    scaler = amp.GradScaler('cuda', enabled=True)  # gradient scaling for mixed precision
 
     # --- Training config ---
-    epochs =  15                 # bump up for real runs
-    grad_clip = 1.0              # max-norm gradient clipping
+    epochs = 15
+    grad_clip = 1.0
     save_dir = Path("runs/checkpoints")
     save_dir.mkdir(parents=True, exist_ok=True)
-    best_dice = -1.0
+    best_dice = -1.0  # track best validation Dice (excluding background)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -353,30 +346,32 @@ def main():
         t0 = time.time()
 
         for batch in train_loader:
-            imgs = batch["image"].to(device, non_blocking=True)                # [B,1,D,H,W]
-            labels = batch["label"][:, 0].long().to(device, non_blocking=True) # [B,D,H,W]
+            imgs = batch["image"].to(device, non_blocking=True)                 # [B,1,D,H,W]
+            labels = batch["label"][:, 0].long().to(device, non_blocking=True)  # [B,D,H,W]
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Mixed precision forward/backward (autocast; no device_type argument)
+            # Mixed precision forward/backward
             with amp.autocast('cuda', dtype=amp_dtype):
-              logits = model(imgs)                         # [B,C,D,H,W]
-              loss_ce = ce_loss(logits, labels)
-              loss_dice = dice_loss(logits, labels)
-              loss = 0.5 * loss_ce + 0.5 * loss_dice       # equal weighting
+                logits = model(imgs)
+                loss_ce = ce_loss(logits, labels)
+                loss_dice = dice_loss(logits, labels)
+                loss = 0.5 * loss_ce + 0.5 * loss_dice  # simple balanced combo
 
-            # Backprop with AMP scaling and gradient clipping
+            # Backprop with scaling to prevent underflow
             scaler.scale(loss).backward()
             if grad_clip is not None:
-                scaler.unscale_(optimizer)
+                scaler.unscale_(optimizer)  # unscale before clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
 
+            # Bookkeeping
             epoch_ce += loss_ce.item()
             epoch_dice += loss_dice.item()
             n_batches += 1
 
+        # Scheduler step per epoch (CosineAnnealing)
         scheduler.step()
         dt = time.time() - t0
         train_ce = epoch_ce / max(n_batches, 1)
@@ -401,12 +396,14 @@ def main():
         }
         torch.save(ckpt, save_dir / "last.pt")
 
+        # Track the best model by foreground mean Dice
         if metrics["val_mean_dice_excl_bg"] > best_dice:
             best_dice = metrics["val_mean_dice_excl_bg"]
             torch.save(ckpt, save_dir / "best.pt")
             print(f"  ↳ New best Dice (excl bg): {best_dice:.4f} — saved to runs/checkpoints/best.pt")
 
     print("Training complete. Best Dice (excl bg):", best_dice)
+
 
 if __name__ == "__main__":
     main()
